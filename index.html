@@ -119,12 +119,11 @@
         };
 
         // ==================== FIREBASE SYNC HOOK ====================
-        const useFirebaseSync = (userId, initialState, onDataUpdate) => {
+        const useFirebaseSync = (userId, onDataUpdate) => {
             const [syncStatus, setSyncStatus] = useState('disconnected'); // 'synced', 'syncing', 'offline', 'disconnected'
             const [lastSynced, setLastSynced] = useState(null);
             const listenersRef = useRef([]);
             const pendingUpdatesRef = useRef({});
-            const isFirstSyncRef = useRef(true);
 
             // Sync data to Firebase
             const syncToFirebase = useCallback((dataType, data) => {
@@ -171,13 +170,8 @@
                             onDataUpdate(dataType, cloudData);
                             setSyncStatus('synced');
                             setLastSynced(new Date());
-                        } else if (isFirstSyncRef.current) {
-                            // No cloud data on first sync - push local data to cloud
-                            const localData = initialState[dataType];
-                            if (localData && (Array.isArray(localData) ? localData.length > 0 : Object.keys(localData).length > 0)) {
-                                syncToFirebase(dataType, localData);
-                            }
                         }
+                        // If no cloud data, we'll push when user makes changes
                     }, (error) => {
                         console.error(`Listen error for ${dataType}:`, error);
                         setSyncStatus('offline');
@@ -186,19 +180,18 @@
                     listenersRef.current.push(() => ref.off('value', listener));
                 });
 
-                isFirstSyncRef.current = false;
-
                 // Monitor connection state
                 const connectedRef = firebaseDb.ref('.info/connected');
                 const connListener = connectedRef.on('value', (snap) => {
                     if (snap.val() === true) {
+                        setSyncStatus('synced');
                         // Reconnected - push any pending updates
                         Object.entries(pendingUpdatesRef.current).forEach(([type, data]) => {
                             syncToFirebase(type, data);
                         });
                         pendingUpdatesRef.current = {};
                     } else {
-                        setSyncStatus('offline');
+                        if (userId) setSyncStatus('offline');
                     }
                 });
                 listenersRef.current.push(() => connectedRef.off('value', connListener));
@@ -207,7 +200,7 @@
                     listenersRef.current.forEach(unsub => unsub());
                     listenersRef.current = [];
                 };
-            }, [userId, onDataUpdate, syncToFirebase, initialState]);
+            }, [userId, onDataUpdate, syncToFirebase]);
 
             return { syncStatus, lastSynced, syncToFirebase };
         };
@@ -566,7 +559,6 @@
             // Firebase Sync
             const { syncStatus, lastSynced, syncToFirebase } = useFirebaseSync(
                 user?.uid,
-                state,
                 handleDataUpdate
             );
 
@@ -580,20 +572,32 @@
                 saveToStorage('settings', state.settings);
             }, [state]);
 
-            // Sync to Firebase when state changes (debounced by the sync function)
-            const syncDataRef = useRef(state);
+            // Sync to Firebase when state changes
+            const prevStateRef = useRef(null);
             useEffect(() => {
-                if (user && syncStatus !== 'syncing') {
-                    // Only sync if data actually changed
-                    const dataTypes = ['transactions', 'accounts', 'goals', 'subscriptions', 'exchangeRates', 'settings'];
-                    dataTypes.forEach(type => {
-                        if (JSON.stringify(syncDataRef.current[type]) !== JSON.stringify(state[type])) {
-                            syncToFirebase(type, state[type]);
-                        }
-                    });
-                    syncDataRef.current = state;
+                if (!user || !syncToFirebase) return;
+
+                // Skip initial render
+                if (prevStateRef.current === null) {
+                    prevStateRef.current = JSON.stringify(state);
+                    return;
                 }
-            }, [state, user, syncToFirebase, syncStatus]);
+
+                const currentStateStr = JSON.stringify(state);
+                if (prevStateRef.current === currentStateStr) return;
+
+                // Sync changed data types
+                const dataTypes = ['transactions', 'accounts', 'goals', 'subscriptions', 'exchangeRates', 'settings'];
+                const prevState = JSON.parse(prevStateRef.current);
+
+                dataTypes.forEach(type => {
+                    if (JSON.stringify(prevState[type]) !== JSON.stringify(state[type])) {
+                        syncToFirebase(type, state[type]);
+                    }
+                });
+
+                prevStateRef.current = currentStateStr;
+            }, [state, user, syncToFirebase]);
 
             const showNotification = (message, type = 'info') => {
                 setNotification({ message, type });
